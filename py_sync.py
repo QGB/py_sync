@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+import fnmatch
 import hashlib
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -12,14 +13,22 @@ class SyncManager:
         self.sftp = None
         self.ssh_client = None
         self.remote_dir = remote_dir
+        # 保存连接参数以备重连
+        self.host = None
+        self.port = None
+        self.user = None
+        self.password = None
+        self.key_filename = None
 
     def connect(self, host, port, user, password=None, key_filename=None):
         """连接到远程服务器"""
+        # 保存连接参数
+        self.host, self.port, self.user, self.password, self.key_filename = host, port, user, password, key_filename
         try:
             logging.info(f"正在连接到 {user}@{host}:{port}...")
             self.ssh_client = paramiko.SSHClient()
             self.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            self.ssh_client.connect(host, port=port, username=user, password=password, key_filename=key_filename, timeout=10)
+            self.ssh_client.connect(self.host, port=self.port, username=self.user, password=self.password, key_filename=self.key_filename, timeout=10)
             self.sftp = self.ssh_client.open_sftp()
             logging.info("SSH/SFTP 连接成功。")
             # 确保远程根目录存在
@@ -52,7 +61,7 @@ class SyncManager:
         """确保连接是活动的，如果不是则重连"""
         if not self.is_connected():
             logging.warning("连接已断开，正在尝试重新连接...")
-            self.connect()
+            self.connect(self.host, self.port, self.user, self.password, self.key_filename)
         return self.is_connected()
 
     def get_remote_md5(self, remote_path):
@@ -150,13 +159,29 @@ def get_local_md5(local_path):
         logging.error(f"获取本地文件 MD5 失败 '{local_path}': {e}")
         return None
 
+def is_path_excluded(relative_path, exclude_patterns):
+    """检查给定的相对路径是否匹配任何排除模式"""
+    # 将Windows路径分隔符统一为'/'以进行匹配
+    path_to_check = relative_path.replace(os.sep, '/')
+    for pattern in exclude_patterns:
+        # 模式匹配目录 (e.g., "__pycache__/")
+        if pattern.endswith('/'):
+            # 如果路径是该目录或在该目录内
+            if path_to_check == pattern.rstrip('/') or path_to_check.startswith(pattern):
+                return True
+        # 模式匹配文件名 (e.g., "*.pyc")
+        elif fnmatch.fnmatch(os.path.basename(path_to_check), pattern):
+            return True
+    return False
+
 class SyncEventHandler(FileSystemEventHandler):
     """处理文件系统事件并触发同步操作"""
-    def __init__(self, sync_manager, local_dir, remote_dir):
+    def __init__(self, sync_manager, local_dir, remote_dir, exclude_patterns):
         super().__init__()
         self.sync_manager = sync_manager
         self.local_dir = local_dir
         self.remote_dir = remote_dir
+        self.exclude_patterns = exclude_patterns
 
     def _get_remote_path(self, local_path):
         """将本地路径转换为远程路径"""
@@ -167,8 +192,17 @@ class SyncEventHandler(FileSystemEventHandler):
         remote_path = os.path.join(self.remote_dir, relative_path).replace('\\', '/')
         return remote_path
 
+    def _is_event_excluded(self, event):
+        """检查事件关联的路径是否被排除"""
+        # 对于移动事件，如果源或目标任一被排除，则忽略整个事件
+        if hasattr(event, 'dest_path'):
+            if is_path_excluded(os.path.relpath(event.dest_path, self.local_dir), self.exclude_patterns):
+                return True
+        return is_path_excluded(os.path.relpath(event.src_path, self.local_dir), self.exclude_patterns)
+
     def on_created(self, event):
         """文件或目录被创建"""
+        if self._is_event_excluded(event): return
         logging.info(f"检测到创建: {'目录' if event.is_directory else '文件'} {event.src_path}")
         remote_path = self._get_remote_path(event.src_path)
         if event.is_directory:
@@ -178,6 +212,7 @@ class SyncEventHandler(FileSystemEventHandler):
 
     def on_modified(self, event):
         """文件被修改"""
+        if self._is_event_excluded(event): return
         # 目录修改事件我们忽略
         if event.is_directory:
             return
@@ -200,6 +235,7 @@ class SyncEventHandler(FileSystemEventHandler):
 
     def on_deleted(self, event):
         """文件或目录被删除"""
+        if self._is_event_excluded(event): return
         logging.info(f"检测到删除: {'目录' if event.is_directory else '文件'} {event.src_path}")
         remote_path = self._get_remote_path(event.src_path)
         if event.is_directory:
@@ -209,12 +245,13 @@ class SyncEventHandler(FileSystemEventHandler):
 
     def on_moved(self, event):
         """文件或目录被移动/重命名"""
+        if self._is_event_excluded(event): return
         logging.info(f"检测到移动/重命名: 从 {event.src_path} 到 {event.dest_path}")
         old_remote_path = self._get_remote_path(event.src_path)
         new_remote_path = self._get_remote_path(event.dest_path)
         self.sync_manager.rename_file_or_dir(old_remote_path, new_remote_path)
 
-def initial_sync(sync_manager, local_dir, remote_dir):
+def initial_sync(sync_manager, local_dir, remote_dir, exclude_patterns):
     """执行初次全量同步检查"""
     logging.info("--- 开始初始同步检查 ---")
     
@@ -227,18 +264,24 @@ def initial_sync(sync_manager, local_dir, remote_dir):
             remote_file_list = stdout.read().decode().split('\0')
             for remote_path in remote_file_list:
                 if remote_path:
-                    relative_path = os.path.relpath(remote_path, remote_dir).replace('/', os.sep)
-                    remote_files[relative_path] = remote_path
+                    relative_path = os.path.relpath(remote_path, remote_dir)
+                    if not is_path_excluded(relative_path, exclude_patterns):
+                        remote_files[relative_path.replace('/', os.sep)] = remote_path
         except Exception as e:
             logging.error(f"获取远程文件列表失败: {e}")
 
 
     # 遍历本地文件
-    for root, dirs, files in os.walk(local_dir):
+    for root, dirs, files in os.walk(local_dir, topdown=True):
+        # 从 dirs 列表中原地移除要排除的目录
+        # 必须使用切片 dirs[:] 来修改列表
+        dirs[:] = [d for d in dirs if not is_path_excluded(os.path.relpath(os.path.join(root, d), local_dir), exclude_patterns)]
+        
         # 1. 同步目录
         for dir_name in dirs:
             local_path = os.path.join(root, dir_name)
             relative_path = os.path.relpath(local_path, local_dir)
+            if is_path_excluded(relative_path, exclude_patterns): continue
             remote_path = os.path.join(remote_dir, relative_path).replace('\\', '/')
             sync_manager.mkdir_p(remote_path)
 
@@ -246,6 +289,12 @@ def initial_sync(sync_manager, local_dir, remote_dir):
         for file_name in files:
             local_path = os.path.join(root, file_name)
             relative_path = os.path.relpath(local_path, local_dir)
+
+            if is_path_excluded(relative_path, exclude_patterns):
+                # 如果文件被排除，但它存在于远程，则将其从待删除列表中移除
+                if relative_path in remote_files:
+                    remote_files.pop(relative_path)
+                continue
             
             # 如果本地文件在远程文件字典中，则检查哈希值
             if relative_path in remote_files:
@@ -288,6 +337,7 @@ if __name__ == "__main__":
     parser.add_argument('-p', '--port', type=int, default=22, help='SSH端口 (默认为 22)')
     parser.add_argument('-k', '--key', type=str, default=None, help='SSH私钥文件路径 (如果使用密钥登录)')
     parser.add_argument('--log-file', type=str, default=None, help='将日志输出到指定文件')
+    parser.add_argument('--exclude', action='append', default=[], help='要排除的文件/目录模式 (例如 "*.pyc", "__pycache__/"). 可多次使用。')
 
     args = parser.parse_args()
 
@@ -313,6 +363,7 @@ if __name__ == "__main__":
     LOCAL_DIR = os.path.abspath(args.local_dir)
     REMOTE_PORT = args.port
     KEY_FILENAME = args.key
+    EXCLUDE_PATTERNS = args.exclude
 
     if not os.path.isdir(LOCAL_DIR):
         logging.error(f"本地目录不存在: {LOCAL_DIR}")
@@ -334,10 +385,10 @@ if __name__ == "__main__":
         exit(1)
 
     # 执行初始同步
-    initial_sync(sync_manager, LOCAL_DIR, REMOTE_DIR)
+    initial_sync(sync_manager, LOCAL_DIR, REMOTE_DIR, EXCLUDE_PATTERNS)
 
     # 创建并启动监控
-    event_handler = SyncEventHandler(sync_manager, LOCAL_DIR, REMOTE_DIR)
+    event_handler = SyncEventHandler(sync_manager, LOCAL_DIR, REMOTE_DIR, EXCLUDE_PATTERNS)
     observer = Observer()
     observer.schedule(event_handler, LOCAL_DIR, recursive=True)
     
